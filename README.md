@@ -13,15 +13,15 @@ tq-md-server/
 ├── main.py                 # 统一入口：一个进程同时启动两个服务
 ├── run.py                  # 行情服务入口（可单独运行）：TqSdk → Redis
 ├── mqtt_service.py         # MQTT 价差服务入口（可单独运行）：Redis → Mosquitto
-├── config.example.py       # 配置示例（提交到仓库）
-├── config.py               # 真实配置（不入库）：TqSdk 账户、Redis、Mosquitto、品种列表
+├── config.example.py       # 配置示例
+├── config.py               # 真实配置：TqSdk 账户、Redis、Mosquitto、品种列表
 ├── core/
 │   ├── quote_manager.py    # 合约订阅、wait_update 循环、行情 Redis 读写
 │   ├── quote_cache.py      # 最新行情缓存（Pub/Sub 增量 + Hash 懒加载）
 │   ├── spread_manager.py   # 跨期价差计算 & Key 工具
 │   └── data_utils.py       # Quote → dict 转换工具
 ├── requirements.txt
-└── run_service.sh          # Linux 后台管理（运行统一入口）
+└── run_service.sh          # Linux 后台管理
 ```
 
 ## 快速开始
@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 ### 2. 配置
 
-复制 `config.example.py` 为 `config.py` 并填入真实值（`config.py` 已被 `.gitignore` 排除，不会提交）：
+复制 `config.example.py` 为 `config.py` 并填入真实值
 
 ```python
 TQ_CONFIG = {"user_name": "快期账户", "password": "账户密码"}
