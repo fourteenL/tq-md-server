@@ -5,9 +5,11 @@
 import json
 import logging
 import time
+from datetime import datetime, timedelta
+
 import redis
 from tqsdk import TqApi
-from config import EXCHANGE, PRODUCTS, QUERY_CONFIG, REDIS_PUB_NAME
+from config import EXCHANGE, PRODUCTS, QUERY_CONFIG, QUOTE_CLEAN_INTERVAL, QUOTE_STALE_DAYS, REDIS_PUB_NAME
 
 from core.data_utils import quote_to_dict
 
@@ -37,6 +39,43 @@ def store_quotes(r: redis.Redis, all_quotes: dict, contract_product: dict):
     pipe.execute()
     logging.info(f"行情全量写入 Redis，共 {total} 条")
     return total
+
+
+def clean_expired_quotes(r: redis.Redis, all_quotes: dict, stale_days: int = QUOTE_STALE_DAYS):
+    """
+    清理 Redis 行情存储中的过期数据：
+      - 当前订阅之外的合约 Key（历史运行残留、已摘牌合约）→ 删除
+      - 订阅内但 datetime 超过 stale_days 未更新的（本运行期间过期）→ 删除
+      - 旧版价差 Key（合约段含 &）→ 删除
+    datetime 无法解析的保留，等正常行情覆盖。返回删除条数。
+    """
+    active_codes = {c.split(".")[1] for c in all_quotes}
+    cutoff = datetime.now() - timedelta(days=stale_days)
+    pipe = r.pipeline(transaction=False)
+    removed = 0
+
+    for key in r.scan_iter(match=f"{EXCHANGE}:*:*"):
+        parts = key.split(":")
+        if len(parts) != 3:
+            continue
+        code = parts[2]
+        if "&" in code or code not in active_codes:
+            pipe.delete(key)
+            removed += 1
+            continue
+        dt_str = r.hget(key, "datetime")
+        if dt_str:
+            try:
+                if datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%f") < cutoff:
+                    pipe.delete(key)
+                    removed += 1
+            except ValueError:
+                pass
+
+    if removed:
+        pipe.execute()
+    logging.info(f"[ 清理 ] 过期行情清理：删除 {removed} 个 Hash")
+    return removed
 
 
 def update_quotes_incremental(
@@ -92,6 +131,8 @@ def run_update_loop(api: TqApi, r: redis.Redis):
 
     api.wait_update()  # 等待首批行情
     store_quotes(r, all_quotes, contract_product)
+    clean_expired_quotes(r, all_quotes, QUOTE_STALE_DAYS)
+    last_clean = time.monotonic()
 
     t1 = time.perf_counter()
     logging.info(f"订阅初始化完毕。共耗时 {t1 - t0:.4f}s")
@@ -107,3 +148,6 @@ def run_update_loop(api: TqApi, r: redis.Redis):
             )
             end = time.perf_counter()
             logging.info(f"{len(changed_symbols)} 个合约变动，行情更新 {end - start:.4f}s")
+        if time.monotonic() - last_clean >= QUOTE_CLEAN_INTERVAL:
+            clean_expired_quotes(r, all_quotes, QUOTE_STALE_DAYS)
+            last_clean = time.monotonic()
