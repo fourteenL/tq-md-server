@@ -41,11 +41,12 @@ def store_quotes(r: redis.Redis, all_quotes: dict, contract_product: dict):
     return total
 
 
-def clean_expired_quotes(r: redis.Redis, all_quotes: dict, stale_days: int = QUOTE_STALE_DAYS):
+def clean_expired_quotes(r: redis.Redis, all_quotes: dict, stale_days: int = QUOTE_STALE_DAYS, api=None):
     """
     清理 Redis 行情存储中的过期数据：
       - 当前订阅之外的合约 Key（历史运行残留、已摘牌合约）→ 删除
-      - 订阅内但 datetime 超过 stale_days 未更新的（本运行期间过期）→ 删除
+      - 订阅内但行情超过 stale_days 个交易日未更新的（本运行期间过期）→ 删除；
+        提供 api 时按交易日历计时，休市日（节假日/周末）不计入，避免长假误清
       - 旧版价差 Key（合约段含 &）→ 删除
     datetime 无法解析的保留，等正常行情覆盖。返回删除条数。
     """
@@ -53,6 +54,7 @@ def clean_expired_quotes(r: redis.Redis, all_quotes: dict, stale_days: int = QUO
     cutoff = datetime.now() - timedelta(days=stale_days)
     pipe = r.pipeline(transaction=False)
     removed = 0
+    stale_candidates = {}  # {key: datetime} 自然日超期候选，待交易日历精确判定
 
     for key in r.scan_iter(match=f"{EXCHANGE}:*:*"):
         parts = key.split(":")
@@ -66,16 +68,43 @@ def clean_expired_quotes(r: redis.Redis, all_quotes: dict, stale_days: int = QUO
         dt_str = r.hget(key, "datetime")
         if dt_str:
             try:
-                if datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%f") < cutoff:
-                    pipe.delete(key)
-                    removed += 1
+                dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%f")
+                if dt < cutoff:
+                    stale_candidates[key] = dt  # 交易日数 >= stale_days 才删，粗筛自然日下界不会漏删
             except ValueError:
                 pass
 
+    if stale_candidates:
+        today = datetime.now().date()
+        expired_keys = _judge_stale_by_trading_days(stale_candidates, stale_days, today, api)
+        for key in expired_keys:
+            pipe.delete(key)
+            removed += 1
+
     if removed:
         pipe.execute()
-    logging.info(f"[ 清理 ] 过期行情清理：删除 {removed} 个 Hash")
+    logging.info(f"[ 清理 ] 过期行情清理：删除 {removed} 个 Hash（休市日不计入过期计时）")
     return removed
+
+
+def _judge_stale_by_trading_days(stale_candidates: dict, stale_days: int, today, api) -> list:
+    """
+    交易日判定：(行情日期, today] 区间内交易日数 >= stale_days 才算过期。
+    api 不可用或日历查询失败时回退自然日判定（全部视为过期候选）。
+    """
+    if api is None:
+        return list(stale_candidates)
+    try:
+        earliest = min(stale_candidates.values()).date()
+        calendar = api.get_trading_calendar(start_dt=earliest, end_dt=today)
+        trading_days = {d.date() for d in calendar[calendar["trading"]]["date"]}
+        return [
+            key for key, dt in stale_candidates.items()
+            if sum(1 for d in trading_days if dt.date() < d <= today) >= stale_days
+        ]
+    except Exception as e:
+        logging.warning(f"[ 清理 ] 交易日历查询失败，本轮按自然日判定: {e}")
+        return list(stale_candidates)
 
 
 def update_quotes_incremental(
@@ -131,7 +160,7 @@ def run_update_loop(api: TqApi, r: redis.Redis):
 
     api.wait_update()  # 等待首批行情
     store_quotes(r, all_quotes, contract_product)
-    clean_expired_quotes(r, all_quotes, QUOTE_STALE_DAYS)
+    clean_expired_quotes(r, all_quotes, QUOTE_STALE_DAYS, api=api)
     last_clean = time.monotonic()
 
     t1 = time.perf_counter()
@@ -149,5 +178,5 @@ def run_update_loop(api: TqApi, r: redis.Redis):
             end = time.perf_counter()
             logging.info(f"{len(changed_symbols)} 个合约变动，行情更新 {end - start:.4f}s")
         if time.monotonic() - last_clean >= QUOTE_CLEAN_INTERVAL:
-            clean_expired_quotes(r, all_quotes, QUOTE_STALE_DAYS)
+            clean_expired_quotes(r, all_quotes, QUOTE_STALE_DAYS, api=api)
             last_clean = time.monotonic()

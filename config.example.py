@@ -19,7 +19,7 @@ REDIS_CONFIG = {
 REDIS_PUB_NAME = "shfe:quotes"  # 行情 Pub/Sub 频道名
 
 # ---- 行情存储清理 ----
-QUOTE_STALE_DAYS = 7          # 行情超过 N 天未更新视为过期，从 Redis 清理
+QUOTE_STALE_DAYS = 7          # 行情超过 N 个交易日未更新视为过期（休市日不计入，长假不误清）
 QUOTE_CLEAN_INTERVAL = 21600  # 清理周期（秒），默认 6 小时
 
 # ---- MQTT 价差服务（Mosquitto）----
