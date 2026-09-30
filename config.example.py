@@ -18,13 +18,6 @@ REDIS_CONFIG = {
 }
 REDIS_PUB_NAME = "shfe:quotes"  # 行情 Pub/Sub 频道名
 
-# ---- WS 订阅服务（旧版，已停用，保留回滚用）----
-WS_CONFIG = {"host": "0.0.0.0", "port": 8765}
-WS_USER_KEY = "tq:ws:users"        # 用户认证表（Redis Hash: 用户 → token）
-WS_SUBS_KEY_PREFIX = "tq:ws:subs:"  # 用户订阅持久化（Redis Set）
-WS_AUTH_TIMEOUT = 10               # 连接后完成认证的时限（秒）
-WS_PUSH_INTERVAL = 5               # 无行情变动时重推最后快照的间隔（秒）
-
 # ---- MQTT 价差服务（Mosquitto）----
 MQTT_CONFIG = {
     "host": "127.0.0.1",

@@ -13,7 +13,6 @@ tq-md-server/
 ├── main.py                 # 统一入口：一个进程同时启动两个服务
 ├── run.py                  # 行情服务入口（可单独运行）：TqSdk → Redis
 ├── mqtt_service.py         # MQTT 价差服务入口（可单独运行）：Redis → Mosquitto
-├── ws_server.py            # （已停用）旧 WebSocket 版价差服务，保留作回滚，入口不再启动
 ├── config.example.py       # 配置示例（提交到仓库）
 ├── config.py               # 真实配置（不入库）：TqSdk 账户、Redis、Mosquitto、品种列表
 ├── core/
@@ -69,8 +68,6 @@ python mqtt_service.py        # 仅 MQTT 价差服务（需 Redis 中已有行�
 ./run_service.sh stop         # 停止
 ./run_service.sh status       # 状态
 ```
-
-> 旧 WebSocket 版价差服务（`ws_server.py`）已停用，保留作回滚；如需同时运行需改其端口/client id 避免冲突。
 
 ## 数据流程
 

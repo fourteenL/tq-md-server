@@ -1,5 +1,4 @@
 tqsdk
 redis
 orjson
-websockets
 aiomqtt
