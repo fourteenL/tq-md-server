@@ -1,0 +1,9 @@
+.gitignore
+.venv
+/__pycache__
+*/*__pycache__
+/v0.0.1
+/tqsdk-skill
+h.py
+test.py
+config.py
