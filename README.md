@@ -47,6 +47,9 @@ REDIS_CONFIG = {
 }
 REDIS_PUB_NAME = "shfe:quotes"  # 行情 Pub/Sub 频道名
 
+QUOTE_STALE_DAYS = 7          # 行情超过 N 天未更新视为过期，从 Redis 清理
+QUOTE_CLEAN_INTERVAL = 21600  # 清理周期（秒），默认 6 小时
+
 MQTT_CONFIG = {                 # Mosquitto broker
     "host": "0.0.0.0",
     "port": 1883,
@@ -116,6 +119,8 @@ open_interest   456789.0
 ```
 
 **Pub/Sub 消息**（频道 `shfe:quotes`）：`[{"ag2610": {上述字段...}}, ...]`
+
+**过期清理**：行情服务启动时及每 `QUOTE_CLEAN_INTERVAL`（默认 6 小时）自动清理 Redis 行情：当前订阅之外的合约（历史残留、已摘牌）、`datetime` 超过 `QUOTE_STALE_DAYS`（默认 7 天）未更新的合约（本运行期间过期），以及旧版价差残留 Key 均会被删除；被清理的合约若再次产生行情会自动重建。
 
 ## MQTT 接口
 
