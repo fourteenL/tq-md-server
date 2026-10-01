@@ -1,14 +1,41 @@
 """
-跨期价差计算 & 行情 Key 工具（行情服务与 WS 订阅服务共享）
+跨期价差计算 & 行情 Key 工具（行情服务与 MQTT 价差服务共享）
 """
 
 import math
 import re
+from itertools import combinations
 
 from config import EXCHANGE
 
 PID_RE = re.compile(r"[A-Za-z]+")
 CODE_RE = re.compile(r"[A-Za-z]+\d+")
+PRODUCT_RE = re.compile(r"[A-Za-z]+")
+
+
+def parse_entry(entry):
+    """
+    订阅条目分类：("product", "ag") 品种 / ("pair", (a_code, b_code)) 合约对 / None。
+    含 & 的按合约对解析，纯字母按品种解析。
+    """
+    if not isinstance(entry, str):
+        return None
+    if "&" in entry:
+        parsed = parse_pair(entry)
+        return ("pair", parsed) if parsed else None
+    if PRODUCT_RE.fullmatch(entry):
+        return ("product", entry)
+    return None
+
+
+def product_pairs(codes) -> list:
+    """
+    品种全部在市合约的跨期组合，远月在前（a=远月，b=近月，与价差公式约定一致）。
+    codes: 合约代码集合，如 {"ag2610", "ag2612", "ag2702"}，
+    返回 [("ag2702", "ag2612"), ("ag2702", "ag2610"), ("ag2612", "ag2610"), ...]
+    """
+    ordered = sorted(codes, key=lambda c: int(re.search(r"\d+", c).group()), reverse=True)
+    return list(combinations(ordered, 2))
 
 
 def quote_key(code: str):

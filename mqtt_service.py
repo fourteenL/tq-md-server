@@ -3,9 +3,14 @@ MQTT 价差服务：订阅 Redis 行情，计算用户订阅的跨期价差，�
 
 主题（QoS 1）：
   tq/spread/{user}/{第一腿}&{第二腿}   价差推送（retain，新订阅即得最后值）
-  tq/sub/{user}                        增加订阅：{"pairs": "a&b" 或 ["a&b", ...]}（增量，不影响已有订阅）
-  tq/unsub/{user}                      删除订阅：{"pairs": "a&b" 或 ["a&b", ...]}（retain 价差同步清除）
-  tq/status/{user}                     处理结果（retain）：{"subscribed": [...], "invalid": [...], "pending": [...]}
+  tq/sub/{user}                        增加订阅：{"pairs": ["a&b" 或 "品种", ...]}（增量，不影响已有）
+  tq/unsub/{user}                      删除订阅：payload 同上（品种则整组移除，retain 价差同步清除）
+  tq/status/{user}                     处理结果（retain）：{subscribed, products, invalid, pending}
+
+条目两种形式：
+  合约对 "ag2612&ag2610"（第一腿=远月 a，第二腿=近月 b）
+  品种   "ag"（自动展开为该品种全部在市合约的跨期组合，远月在前；
+          订阅时与服务重启时按当时在市合约展开，新合约上市后重启或重订即纳入）
 
 注意：控制消息不要使用 retain——服务会忽略 retained 控制消息，避免历史消息重放；
      订阅的持久化由服务端 Redis 注册表负责。
@@ -22,6 +27,7 @@ MQTT 价差服务：订阅 Redis 行情，计算用户订阅的跨期价差，�
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -31,6 +37,7 @@ import redis
 import redis.asyncio as aioredis
 
 from config import (
+    EXCHANGE,
     MQTT_CONFIG,
     MQTT_PUSH_INTERVAL,
     MQTT_SUB_KEY_PREFIX,
@@ -38,16 +45,31 @@ from config import (
     REDIS_PUB_NAME,
 )
 from core.quote_cache import QuoteCache
-from core.spread_manager import calc_spread, parse_pair
+from core.spread_manager import CODE_RE, calc_spread, parse_entry, product_pairs
 
 CLIENT_ID = "tq-md-spread"
 CONTROL_PREFIX = "tq/sub/"      # 增加订阅
 UNSUB_PREFIX = "tq/unsub/"      # 删除订阅
 LEGACY_SUB_KEY_PREFIX = "tq:ws:subs:"  # 旧 WS 服务遗留注册表，首次运行自动迁移
 
-CLIENTS = {}    # {user: set((a_code, b_code))}
+CLIENTS = {}    # {user: UserSubs}
 PUSHED_AT = {}  # {(user, "a&b"): time.monotonic()}
 BROKER = {"client": None}  # 当前 aiomqtt Client，断线期间为 None
+
+
+@dataclasses.dataclass
+class UserSubs:
+    """单个用户的订阅状态：显式合约对 + 品种订阅（展开为全部跨期组合）"""
+
+    products: set = dataclasses.field(default_factory=set)   # {"ag"}
+    pairs: set = dataclasses.field(default_factory=set)      # {("ag2612", "ag2610")}
+    expanded: set = dataclasses.field(default_factory=set)   # 品种展开的对 {("ag2702", "ag2612"), ...}
+
+    def all_pairs(self) -> set:
+        return self.pairs | self.expanded
+
+    def is_empty(self) -> bool:
+        return not self.products and not self.pairs
 
 
 def subs_key(user: str) -> str:
@@ -93,8 +115,8 @@ async def dispatch(r, cache: QuoteCache, changed: set):
     if client is None or not changed:
         return
     now = time.monotonic()
-    for user, pairs in list(CLIENTS.items()):
-        for a_code, b_code in list(pairs):
+    for user, subs in list(CLIENTS.items()):
+        for a_code, b_code in list(subs.all_pairs()):
             if a_code in changed or b_code in changed:
                 spread = await current_spread(r, cache, a_code, b_code)
                 if spread is not None:
@@ -107,8 +129,8 @@ async def push_due(r, cache: QuoteCache, interval: float):
     if client is None:
         return
     now = time.monotonic()
-    for user, pairs in list(CLIENTS.items()):
-        for a_code, b_code in sorted(pairs):
+    for user, subs in list(CLIENTS.items()):
+        for a_code, b_code in sorted(subs.all_pairs()):
             pair_str = f"{a_code}&{b_code}"
             if now - PUSHED_AT.get((user, pair_str), 0.0) < interval:
                 continue
@@ -129,8 +151,21 @@ async def snapshot_pusher(r, cache: QuoteCache, interval: float):
             logging.error(f"[ MQTT ] 快照重推异常: {e}")
 
 
+async def _product_contracts(r, product: str) -> set:
+    """品种当前在市合约（以 Redis 行情 Hash 为准，即 tq 服务订阅的未过期合约）"""
+    codes = set()
+    async for key in r.scan_iter(match=f"{EXCHANGE}:{product}:*"):
+        parts = key.split(":")
+        if len(parts) != 3:
+            continue
+        code = parts[2]
+        if "&" not in code and CODE_RE.fullmatch(code):
+            codes.add(code)
+    return codes
+
+
 async def load_user_subs(r):
-    """从 Redis 恢复所有用户订阅；旧 tq:ws:subs:* 首次运行自动迁移到 tq:subs:*"""
+    """从 Redis 恢复所有用户订阅（含品种展开）；旧 tq:ws:subs:* 首次运行自动迁移到 tq:subs:*"""
     async for key in r.scan_iter(match=f"{LEGACY_SUB_KEY_PREFIX}*"):
         user = key[len(LEGACY_SUB_KEY_PREFIX):]
         if not await r.exists(subs_key(user)):
@@ -140,10 +175,21 @@ async def load_user_subs(r):
                 logging.info(f"[ MQTT ] 已迁移用户 {user} 的 {len(members)} 条订阅（{key} → {subs_key(user)}）")
     async for key in r.scan_iter(match=f"{MQTT_SUB_KEY_PREFIX}*"):
         user = key[len(MQTT_SUB_KEY_PREFIX):]
-        pairs = {p for entry in await r.smembers(key) if (p := parse_pair(entry))}
-        if pairs:
-            CLIENTS[user] = pairs
-            logging.info(f"[ MQTT ] 恢复用户 {user} 的 {len(pairs)} 个订阅对")
+        subs = UserSubs()
+        for entry in await r.smembers(key):
+            kind = parse_entry(entry)
+            if kind and kind[0] == "product":
+                subs.products.add(kind[1])
+            elif kind and kind[0] == "pair":
+                subs.pairs.add(kind[1])
+        for product in subs.products:
+            subs.expanded |= set(product_pairs(await _product_contracts(r, product)))
+        if not subs.is_empty():
+            CLIENTS[user] = subs
+            logging.info(
+                f"[ MQTT ] 恢复用户 {user}：{len(subs.products)} 个品种 + {len(subs.pairs)} 个合约对"
+                f"（生效 {len(subs.all_pairs())} 对）"
+            )
 
 
 def route_control(topic: str):
@@ -189,7 +235,8 @@ async def clear_retained(client, user: str, pair_str: str):
 async def apply_control(r, cache: QuoteCache, user: str, payload, add: bool):
     """
     处理订阅控制：tq/sub/{user} 增加订阅（增量，不影响已有），tq/unsub/{user} 删除订阅。
-    处理结果（当前完整订阅集 + invalid + pending）经 tq/status/{user} 回发。
+    条目支持合约对 "a&b" 与品种 "ag"（展开为全部在市合约的跨期组合，远月在前）。
+    处理结果（当前完整订阅 + products + invalid + pending）经 tq/status/{user} 回发。
     """
     if payload is None or payload == b"" or payload == "":
         return  # 空消息是 retain 清除操作，静默忽略
@@ -198,53 +245,85 @@ async def apply_control(r, cache: QuoteCache, user: str, payload, add: bool):
         await publish_status(BROKER["client"], user, {"error": err})
         return
 
-    desired, invalid = set(), []
+    subs = CLIENTS.get(user) or UserSubs()
+    invalid, prods_delta, pairs_delta = [], set(), set()
     for entry in entries:
-        parsed = parse_pair(entry)
-        if parsed is None:
+        kind = parse_entry(entry)
+        if kind is None:
             invalid.append(entry)
+        elif kind[0] == "product":
+            if add and not await _product_contracts(r, kind[1]):
+                invalid.append(entry)  # 品种当前无在市合约
+            else:
+                prods_delta.add(kind[1])
         else:
-            desired.add(parsed)
+            pairs_delta.add(kind[1])
 
-    current = CLIENTS.get(user, set())
+    new_prods = set(subs.products | prods_delta) if add else set(subs.products - prods_delta)
+    new_pairs = set(subs.pairs | pairs_delta) if add else set(subs.pairs - pairs_delta)
+
+    # 注册表同步（品种存裸代码，合约对存 "a&b"）
+    pipe = r.pipeline(transaction=False)
+    if add:
+        if prods_delta:
+            pipe.sadd(subs_key(user), *prods_delta)
+        if pairs_delta:
+            pipe.sadd(subs_key(user), *(f"{a}&{b}" for a, b in pairs_delta))
+    else:
+        if prods_delta:
+            pipe.srem(subs_key(user), *prods_delta)
+        if pairs_delta:
+            pipe.srem(subs_key(user), *(f"{a}&{b}" for a, b in pairs_delta))
+    pipe.execute()
+
+    # 按当前在市合约重新展开品种
+    new_expanded = set()
+    for product in new_prods:
+        new_expanded |= set(product_pairs(await _product_contracts(r, product)))
+
+    new_subs = UserSubs(new_prods, new_pairs, new_expanded)
+    old_effective = subs.all_pairs()
+    new_effective = new_subs.all_pairs()
+
     client = BROKER["client"]
     now = time.monotonic()
 
-    if add:
-        for pair in desired - current:
-            await r.sadd(subs_key(user), f"{pair[0]}&{pair[1]}")
-        new = current | desired
-    else:
-        for pair in desired & current:
-            await r.srem(subs_key(user), f"{pair[0]}&{pair[1]}")
-            PUSHED_AT.pop((user, f"{pair[0]}&{pair[1]}"), None)
-            if client is not None:
-                await clear_retained(client, user, f"{pair[0]}&{pair[1]}")
-        new = current - desired
-
-    if new:
-        CLIENTS[user] = new
-    else:
-        CLIENTS.pop(user, None)
-
-    newly = (desired - current) if add else set()
-    subscribed, pending = [], []
-    for a_code, b_code in sorted(new):
-        pair_str = f"{a_code}&{b_code}"
-        subscribed.append(pair_str)
+    # 新增生效对：立即发布当前价差
+    for a_code, b_code in sorted(new_effective - old_effective):
         spread = await current_spread(r, cache, a_code, b_code)
-        if spread is None:
-            pending.append(pair_str)
-        elif client is not None and (a_code, b_code) in newly:
+        if spread is not None and client is not None:
             await publish_one(client, user, a_code, b_code, spread, now)
 
+    # 移除生效对：清 retain 与推送时间
+    for a_code, b_code in sorted(old_effective - new_effective):
+        PUSHED_AT.pop((user, f"{a_code}&{b_code}"), None)
+        if client is not None:
+            await clear_retained(client, user, f"{a_code}&{b_code}")
+
+    if new_subs.is_empty():
+        CLIENTS.pop(user, None)
+    else:
+        CLIENTS[user] = new_subs
+
+    subscribed, pending = [], []
+    for a_code, b_code in sorted(new_effective):
+        pair_str = f"{a_code}&{b_code}"
+        subscribed.append(pair_str)
+        if await current_spread(r, cache, a_code, b_code) is None:
+            pending.append(pair_str)
+
     action = "增加" if add else "删除"
-    changed = len(newly) if add else len(desired & current)
     logging.info(
-        f"[ MQTT ] 用户 {user} {action} {changed} 对：现有 {len(subscribed)} 对"
+        f"[ MQTT ] 用户 {user} {action}：品种 {sorted(prods_delta)}，合约对 {len(pairs_delta)} 个；"
+        f"当前 {len(new_prods)} 品种 + {len(new_pairs)} 对，生效 {len(new_effective)} 对"
         f"（pending {len(pending)}，invalid {len(invalid)}）"
     )
-    await publish_status(client, user, {"subscribed": subscribed, "invalid": invalid, "pending": pending})
+    await publish_status(client, user, {
+        "subscribed": subscribed,
+        "products": sorted(new_prods),
+        "invalid": invalid,
+        "pending": pending,
+    })
 
 
 async def redis_quote_listener(r, cache: QuoteCache):
