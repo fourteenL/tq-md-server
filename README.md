@@ -14,6 +14,7 @@ tq-md-server/
 ├── run.py                  # 行情服务入口（可单独运行）：TqSdk → Redis
 ├── mqtt_service.py         # MQTT 价差服务入口（可单独运行）：Redis → Mosquitto
 ├── config.example.py       # 配置示例
+├── api.md                  # MQTT 对接文档（可直接发给第三方）
 ├── config.py               # 真实配置：TqSdk 账户、Redis、Mosquitto、品种列表
 ├── core/
 │   ├── quote_manager.py    # 合约订阅、wait_update 循环、行情 Redis 读写
