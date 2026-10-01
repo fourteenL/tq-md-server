@@ -274,7 +274,7 @@ async def apply_control(r, cache: QuoteCache, user: str, payload, add: bool):
             pipe.srem(subs_key(user), *prods_delta)
         if pairs_delta:
             pipe.srem(subs_key(user), *(f"{a}&{b}" for a, b in pairs_delta))
-    pipe.execute()
+    await pipe.execute()
 
     # 按当前在市合约重新展开品种
     new_expanded = set()
